@@ -20,7 +20,11 @@ embedding_dim = 384  # Embedding size of MiniLM-L6-v2
 faiss_index = None
 cv_store = {}
 
-together_api_key = "3af858d7c0f222a22514e1cf0ac730cdb8848a17d4b667cf06f76bbfc9ca371b"
+together_api_key =  os.getenv("TOGETHER_API_KEY")
+
+if not together_api_key:
+    raise ValueError("❌ ERROR: TOGETHER_API_KEY not found in .env file! Please set it before running.")
+
 
 # Initialize the Together AI Chat Model
 chat_model = ChatTogether(
