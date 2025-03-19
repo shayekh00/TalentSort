@@ -2,45 +2,53 @@ import os
 import pdfplumber
 import uuid
 import numpy as np
+import spacy
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 import faiss
 from langchain_together import ChatTogether
+from dotenv import load_dotenv
+from serpapi import GoogleSearch
+
+# Load environment variables
+load_dotenv()
 
 app = FastAPI()
 
-# Remove default folder; user will now supply folder path via the endpoint
+# Load Spacy NER model
+nlp = spacy.load("en_core_web_sm")
 
-# Load SentenceTransformer Embedding Model
+# Load SentenceTransformer Model
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# FAISS Index and CV store will be initialized when the folder is loaded
-embedding_dim = 384  # Embedding size of MiniLM-L6-v2
+# FAISS Index and CV Store
+embedding_dim = 384  # MiniLM embedding size
 faiss_index = None
 cv_store = {}
 
-together_api_key =  os.getenv("TOGETHER_API_KEY")
+# API Keys
+serpapi_key = os.getenv("SERPAPI_KEY")
+together_api_key = os.getenv("TOGETHER_API_KEY")
 
 if not together_api_key:
-    raise ValueError("❌ ERROR: TOGETHER_API_KEY not found in .env file! Please set it before running.")
+    raise ValueError("❌ ERROR: TOGETHER_API_KEY not found in .env file!")
 
+if not serpapi_key:
+    raise ValueError("❌ ERROR: SERPAPI_KEY not found in .env file!")
 
-# Initialize the Together AI Chat Model
+# Initialize Together AI Chat Model
 chat_model = ChatTogether(
     model="meta-llama/Llama-3-70b-chat-hf",
     together_api_key=together_api_key
 )
 
-# Pydantic models for incoming requests
-class SearchQuery(BaseModel):
+class SearchRequest(BaseModel):
+    folder_path: str
     query: str
 
-class FolderPath(BaseModel):
-    folder_path: str
-
 def extract_text_from_pdf(pdf_path):
-    """Extract text from a given PDF file."""
+    """Extract text from a PDF file."""
     text = ""
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
@@ -50,7 +58,7 @@ def extract_text_from_pdf(pdf_path):
     return text
 
 def process_folder(folder_path):
-    """Loads all PDFs from the given folder and returns a FAISS index and CV store."""
+    """Loads PDFs from a folder and stores their embeddings."""
     index = faiss.IndexFlatL2(embedding_dim)
     store = {}
     for filename in os.listdir(folder_path):
@@ -63,92 +71,72 @@ def process_folder(folder_path):
             store[file_id] = {"filename": filename, "text": extracted_text[:300]}
     return index, store
 
-@app.post("/load_folder/")
-async def load_folder(folder: FolderPath):
-    """Loads CVs from a provided folder path."""
-    global faiss_index, cv_store
-    folder_path = folder.folder_path
-    if not os.path.isdir(folder_path):
-        return {"error": "Provided folder path is not valid."}
-    faiss_index, cv_store = process_folder(folder_path)
-    return {"message": f"Loaded {len(cv_store)} CVs from {folder_path}"}
+def extract_company_names(text):
+    """Extract company names using NER."""
+    doc = nlp(text)
+    return [ent.text for ent in doc.ents if ent.label_ == "ORG"]
 
-def refine_query(query):
-    """Use Together AI to improve search queries."""
-    response = chat_model.invoke(f"Rewrite this job description into a structured search query for candidate selection: {query}")
-    if hasattr(response, 'content'):
-        return response.content
-    return response
+def get_company_reputation(company_name):
+    """Fetch company reputation using SerpAPI."""
+    search = GoogleSearch({
+        "q": f"{company_name} company review OR Glassdoor rating OR funding OR reputation",
+        "api_key": serpapi_key
+    })
+    results = search.get_dict()
+    return results["organic_results"][0]["snippet"] if "organic_results" in results else "No data available"
 
-class SearchRequest(BaseModel):
-    folder_path: str
-    query: str
+def compute_final_score(semantic_score, experience_score, company_score):
+    """Compute the final ranking score."""
+    return (0.6 * semantic_score) + (0.2 * experience_score) + (0.2 * company_score)
 
 @app.post("/search/")
 async def search_cvs(request: SearchRequest):
-    """Loads CVs from the provided folder and performs a search immediately."""
+    """Loads CVs from a folder and performs a search immediately."""
     global faiss_index, cv_store
     folder_path = request.folder_path
 
-    # Validate folder path
     if not os.path.isdir(folder_path):
-        return {"error": "Provided folder path is not valid."}
+        return {"error": "Invalid folder path."}
 
-    # Load and process folder
     faiss_index, cv_store = process_folder(folder_path)
-
-    # Ensure that PDFs were found in the provided folder
     if not cv_store:
-        return {"error": "No PDFs found in the provided folder."}
+        return {"error": "No PDFs found."}
 
-    # ✨ Step 1: Improve the search query using Together AI
-    refined_query = refine_query(request.query)
+    refined_query = chat_model.invoke(f"Rewrite this job description: {request.query}")
+    refined_query = refined_query.content if hasattr(refined_query, 'content') else refined_query
 
-    # ✅ Extract content correctly from AIMessage
-    if isinstance(refined_query, list) and len(refined_query) > 0:
-        refined_query = refined_query[0].content  # Extract from list
-    elif hasattr(refined_query, 'content'):
-        refined_query = refined_query.content  # Extract from AIMessage
-
-    print(f"Original Query: {request.query}")
-    print(f"Refined Query: {refined_query}")
-
-    # 🧠 Step 2: Generate an embedding for the improved query
     query_embedding = embedding_model.encode(refined_query, convert_to_numpy=True)
-
-    # 🔍 Step 3: Search FAISS for top matches
     D, I = faiss_index.search(np.array([query_embedding]), k=5)
 
     results = []
     for i, idx in enumerate(I[0]):
         if idx < len(cv_store):
             file_id = list(cv_store.keys())[idx]
+            resume_text = cv_store[file_id]["text"]
+            filename = cv_store[file_id]["filename"]
+            
+            company_names = extract_company_names(resume_text)
+            company_score = sum(0.2 for company in company_names if "4." in get_company_reputation(company))
+            
+            experience_score = 0
+            years_experience = [int(num) for num in resume_text.split() if num.isdigit() and int(num) < 50]
+            if years_experience:
+                experience_score = min(max(years_experience) / 20, 1)
+
+            final_score = compute_final_score(D[0][i], experience_score, company_score)
+
             results.append({
-                "filename": cv_store[file_id]["filename"],
-                "score": float(D[0][i]),
-                "text_snippet": cv_store[file_id]["text"]
+                "filename": filename,
+                "score": float(final_score),  # Convert NumPy float32 to Python float
+                "semantic_score": float(D[0][i]),  # Ensure conversion
+                "experience_score": float(experience_score),  # Ensure conversion
+                "company_score": float(company_score),  # Ensure conversion
+                "text_snippet": resume_text[:300]
             })
 
+    results.sort(key=lambda x: x["score"], reverse=True)
     return {
         "original_query": request.query,
         "refined_query": refined_query,
         "results": results
     }
-
-@app.post("/upload/")
-async def upload_file(file: UploadFile = File(...)):
-    """Uploads a PDF file, extracts text, and stores embeddings into the loaded folder context."""
-    global faiss_index, cv_store
-    if faiss_index is None:
-        return {"error": "No folder loaded. Please load a folder using the /load_folder/ endpoint."}
-    file_id = str(uuid.uuid4())
-    # Save file temporarily
-    temp_path = os.path.join(os.getcwd(), file.filename)
-    with open(temp_path, "wb") as f:
-        f.write(file.file.read())
-    extracted_text = extract_text_from_pdf(temp_path)
-    embedding = embedding_model.encode(extracted_text, convert_to_numpy=True)
-    faiss_index.add(np.array([embedding]))
-    cv_store[file_id] = {"filename": file.filename, "text": extracted_text[:300]}
-    os.remove(temp_path)  # Clean up the temporary file
-    return {"file_id": file_id, "message": "File uploaded and processed successfully."}
