@@ -1,6 +1,6 @@
 ﻿## 🏗️ TalentSort Architecture
 
-![TalentSort Architecture](assets/architecture.png)
+![TalentSort Architecture](assets/architecture2.png)
 
 📄 TalentSort: AI-Powered CV Sorting App
 
